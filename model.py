@@ -9,16 +9,16 @@ http://arxiv.org/abs/1502.03044
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from torch.nn.utils.rnn import pack_padded_sequence
 from torch.autograd import Variable
+from torch.nn.utils.rnn import pack_padded_sequence
 
 class EncoderCNN(nn.Module):
     def __init__(self, embed_size):
         super(EncoderCNN, self).__init__()
-        resnet = models.resnet152(pretrained=True)
-        modules = list(resnet.children())[:-1]      # delete the last fc layer.
-        self.resnet = nn.Sequential(*modules)
-        self.linear = nn.Linear(resnet.fc.in_features , embed_size)
+        vggnet = models.vgg19(pretrained=True)
+        modules = list(vggnet.children())[:-1]
+        self.vggnet = nn.Sequential(*modules)
+        self.linear = nn.Linear(vggnet.classifier[6].in_features, embed_size)
         self.bn = nn.BatchNorm1d(embed_size, momentum=0.01)
         self.init_weights()
 
@@ -27,8 +27,9 @@ class EncoderCNN(nn.Module):
         self.linear.bias.data.fill_(0)
 
     def forward(self, images):
-        features = self.resnet(images)
+        features = self.vggnet(images)
         features = Variable(features.data)
+        print (features)
         features = features.view(features.size(0), -1)
         features = self.bn(self.linear(features))
         return features
@@ -37,7 +38,11 @@ class EncoderCNN(nn.Module):
 class AttnDecoderRNN(nn.Module):
     def __init__(self, embed_size, hidden_size, vocab_size, num_layers):
         super(AttnDecoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
         self.embed = nn.Embedding(vocab_size, embed_size)
+        self.attn = nn.Linear(hidden_size, hidden_size)
         self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=True)
         self.linear = nn.Linear(hidden_size, vocab_size)
         self.init_weights()
@@ -47,23 +52,49 @@ class AttnDecoderRNN(nn.Module):
         self.linear.weight.data.uniform_(-0.1, 0.1)
         self.linear.bias.data.fill_(0)
 
-    def forward(self, features, captions, lengths):
-        embeddings = self.embed(captions)
-        embeddings = torch.cat((features.unsqueeze(1), embeddings), 1)
-        packed = pack_padded_sequence(embeddings, lengths, batch_first=True)
-        hidden, _ = self.lstm(packed)
-        outputs = self.linear(hidden[0])
-        return outputs
+    def init_hidden(self):
+        return cuda_variable(torch.zeros(self.num_layers, 1, self.hidden_size))
 
-    def sample(self, features, states=None):
-        sampled_ids = []
-        inputs = features.unsqueeze(1)
-        for i in range(20):                                      # maximum sampling length
-            hiddens, states = self.lstm(inputs, states)          # (batch_size, 1, hidden_size),
-            outputs = self.linear(hiddens.squeeze(1))            # (batch_size, vocab_size)
-            predicted = outputs.max(1)[1]
-            sampled_ids.append(predicted)
-            inputs = self.embed(predicted)
-            inputs = inputs.unsqueeze(1)                         # (batch_size, 1, embed_size)
-        sampled_ids = torch.cat(sampled_ids, 0)                  # (batch_size, 20)
-        return sampled_ids.squeeze()
+    def forward(self, captions, last_hidden, encoder_hiddens, lengths):
+        embeddings = self.embed(captions)
+        embeddings = torch.cat((last_hidden.unsqueeze(1), embeddings), 1)
+        packed = pack_padded_sequence(embeddings, lengths, batch_first=True)
+        hiddens, _ = self.lstm(packed)
+        rnn_output = self.linear(hiddens[0])
+        print (rnn_output)
+
+        attn_weights = self._get_att_weight(rnn_output.squeeze(0), encoder_hiddens)
+        context = attn_weights.bmm(encoder_hiddens.transpose(0,1))
+
+        rnn_output = rnn_output.squeeze(0)
+        context = context.squeeze(1)
+        output = self.out(torch.cat((rnn_output, context), 1))
+
+        return output
+
+    def _get_att_weight(self, hidden, encoder_hiddens):
+        seq_len = len(encoder_hiddens)
+
+        # Create variable to store attention energies
+        attn_scores = cuda_variable(torch.zeros(seq_len))  # B x 1 x S
+
+        # Calculate energies for each encoder hidden
+        for i in range(seq_len):
+            attn_scores[i] = self.get_att_score(hidden, encoder_hiddens[i])
+
+        # Normalize scores to weights in range 0 to 1,
+        # resize to 1 x 1 x seq_len
+        # print("att_scores", attn_scores.size())
+        return nn.softmax(attn_scores).view(1, 1, -1)
+
+
+    def get_att_score(self, hidden, encoder_hidden):
+        score = self.attn(encoder_hidden)
+        return torch.dot(hidden.view(-1), score.view(-1))
+
+
+def cuda_variable(tensor):
+    if torch.cuda.is_available():
+        return Variable(tensor.cuda())
+    else:
+        return Variable(tensor)
